@@ -1,0 +1,17 @@
+{
+    "name": "arbitrum-bitlayer-bridge",
+    "version": "1.0.0",
+    "description": "Bridge between Arbitrum and BitLayer",
+    "scripts": {
+        "frontend": "cd frontend && yarn start",
+        "backend": "cd backend && yarn dev",
+        "frontend:install": "cd frontend && yarn install",
+        "backend:install": "cd backend && yarn install",
+        "install:all": "yarn frontend:install && yarn backend:install",
+        "dev": "concurrently \"yarn frontend\" \"yarn backend\""
+    },
+    "devDependencies": {
+        "concurrently": "^8.0.1"
+    },
+    "packageManager": "yarn@1.22.22"
+}

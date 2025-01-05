@@ -1,0 +1,27 @@
+{
+    "name": "arbitrum-bridge-backend",
+    "version": "1.0.0",
+    "description": "Backend service for Arbitrum-BitLayer bridge",
+    "license": "MIT",
+    "scripts": {
+        "start": "node dist/index.js",
+        "build": "tsc",
+        "dev": "ts-node src/index.ts"
+    },
+    "dependencies": {
+        "@koa/router": "^12.0.0",
+        "dotenv": "^16.0.3",
+        "ethers": "^5.7.2",
+        "koa": "^2.14.2",
+        "koa-bodyparser": "^4.4.1"
+    },
+    "devDependencies": {
+        "@types/koa": "^2.13.6",
+        "@types/koa__router": "^12.0.0",
+        "@types/koa-bodyparser": "^4.3.10",
+        "@types/node": "^18.16.3",
+        "ts-node": "^10.9.1",
+        "typescript": "^5.0.4"
+    },
+    "packageManager": "yarn@1.22.22"
+}
