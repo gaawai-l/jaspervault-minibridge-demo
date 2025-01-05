@@ -6,6 +6,25 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+// Types and Interfaces
+interface TokenConfig {
+    symbol: string;
+    name: string;
+    sourceAddress: string;
+    targetAddress?: string;
+    decimals: number;
+    isNative?: boolean;
+    abi: string[];
+}
+
+interface NetworkConfig {
+    name: string;
+    chainId: number;
+    rpc: string;
+    provider: ethers.providers.JsonRpcProvider;
+    isSource?: boolean;
+}
+
 interface ActivityLog {
     fromAddress: string;
     toAddress: string;
@@ -29,37 +48,141 @@ interface WebhookBody {
     };
 }
 
+// Basic ABIs
+const ERC20_ABI = [
+    'function transfer(address to, uint256 amount)',
+    'function balanceOf(address account) view returns (uint256)'
+];
+
+// Token configurations
+const TOKENS: { [key: string]: TokenConfig } = {
+    WBTC: {
+        symbol: 'WBTC',
+        name: 'Wrapped Bitcoin',
+        sourceAddress: process.env.WBTC_ARBITRUM_ADDRESS!,
+        decimals: 8,
+        isNative: true,
+        abi: ERC20_ABI
+    },
+    USDT: {
+        symbol: 'USDT',
+        name: 'Tether USD',
+        sourceAddress: process.env.USDT_ARBITRUM_ADDRESS!,
+        targetAddress: process.env.USDT_BITLAYER_ADDRESS!,
+        decimals: 6,
+        abi: ERC20_ABI
+    }
+};
+
+// Network configurations
+const createNetworkConfig = (
+    name: string,
+    chainId: number,
+    rpc: string,
+    isSource: boolean = false
+): NetworkConfig => {
+    const provider = new ethers.providers.JsonRpcProvider(rpc);
+    if (!isSource) {
+        // Add wallet only for target network
+        const wallet = new ethers.Wallet(process.env.PRIVATE_KEY!, provider);
+        (provider as any).wallet = wallet;
+    }
+    return { name, chainId, rpc, provider, isSource };
+};
+
+const NETWORKS: { [key: string]: NetworkConfig } = {
+    ARBITRUM: createNetworkConfig('Arbitrum One', 42161, process.env.ARBITRUM_RPC!, true),
+    BITLAYER: createNetworkConfig('BitLayer', 200901, process.env.BITLAYER_RPC!)
+};
+
+// Gas settings for different networks
+const GAS_SETTINGS: { [key: string]: any } = {
+    BITLAYER: {
+        maxPriorityFeePerGas: ethers.utils.parseUnits('0.05', 'gwei'),
+        maxFeePerGas: ethers.utils.parseUnits('0.050000007', 'gwei'),
+    }
+};
+
+// Transaction processing cache
+const processedTxs = new Set<string>();
+
+// Clear cache every hour to prevent memory leaks
+setInterval(() => {
+    processedTxs.clear();
+}, 1000 * 60 * 60);
+
+// Helper functions
+const handleNativeTransfer = async (
+    activity: ActivityLog,
+    sourceToken: TokenConfig,
+    targetNetwork: NetworkConfig
+) => {
+    console.log(`Processing ${sourceToken.symbol} transfer: ${activity.fromAddress} sent ${activity.value} ${sourceToken.symbol}`);
+
+    try {
+        // Convert amount based on decimals
+        const sourceAmount = ethers.utils.parseUnits(activity.value.toString(), sourceToken.decimals);
+        const sourceNumber = parseFloat(ethers.utils.formatUnits(sourceAmount, sourceToken.decimals));
+        const targetAmount = ethers.utils.parseEther(sourceNumber.toString());
+
+        const wallet = (targetNetwork.provider as any).wallet as ethers.Wallet;
+        const tx = await wallet.sendTransaction({
+            to: activity.fromAddress,
+            value: targetAmount,
+            ...GAS_SETTINGS[targetNetwork.name]
+        });
+
+        await tx.wait(1);
+        console.log(`${sourceToken.symbol} transfer successful on ${targetNetwork.name}: ${tx.hash}`);
+        return true;
+    } catch (error) {
+        console.error(`${sourceToken.symbol} transfer failed:`, error);
+        return false;
+    }
+};
+
+const handleTokenTransfer = async (
+    activity: ActivityLog,
+    sourceToken: TokenConfig,
+    targetNetwork: NetworkConfig
+) => {
+    if (!sourceToken.targetAddress) {
+        console.error(`No target address configured for ${sourceToken.symbol}`);
+        return false;
+    }
+
+    console.log(`Processing ${sourceToken.symbol} transfer: ${activity.fromAddress} sent ${activity.value} ${sourceToken.symbol}`);
+
+    try {
+        const wallet = (targetNetwork.provider as any).wallet as ethers.Wallet;
+        const tokenContract = new ethers.Contract(
+            sourceToken.targetAddress,
+            sourceToken.abi,
+            wallet
+        );
+
+        const tx = await tokenContract.transfer(
+            activity.fromAddress,
+            ethers.utils.parseUnits(activity.value.toString(), sourceToken.decimals),
+            {
+                ...GAS_SETTINGS[targetNetwork.name]
+            }
+        );
+
+        await tx.wait(1);
+        console.log(`${sourceToken.symbol} transfer successful on ${targetNetwork.name}: ${tx.hash}`);
+        return true;
+    } catch (error) {
+        console.error(`${sourceToken.symbol} transfer failed:`, error);
+        return false;
+    }
+};
+
+// Initialize Koa app and router
 const app = new Koa();
 const router = new Router();
 
-const BITLAYER_RPC = process.env.BITLAYER_RPC;
-const PRIVATE_KEY = process.env.PRIVATE_KEY;
-const BRIDGE_WALLET = process.env.BRIDGE_WALLET_ADDRESS;
-const USDT_BITLAYER = process.env.USDT_BITLAYER_ADDRESS;
-const USDT_ARBITRUM = process.env.USDT_ARBITRUM_ADDRESS;
-const WBTC_ARBITRUM = "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f"; // Arbitrum WBTC address
-
-if (!BITLAYER_RPC || !PRIVATE_KEY || !BRIDGE_WALLET || !USDT_BITLAYER || !USDT_ARBITRUM) {
-    throw new Error("Required environment variables are not set");
-}
-
-const bitlayerProvider = new ethers.providers.JsonRpcProvider(BITLAYER_RPC);
-const bitlayerWallet = new ethers.Wallet(PRIVATE_KEY!, bitlayerProvider);
-
-// Add gas settings for BitLayer
-const BITLAYER_GAS_SETTINGS = {
-    maxPriorityFeePerGas: ethers.utils.parseUnits('0.05', 'gwei'),
-    maxFeePerGas: ethers.utils.parseUnits('0.050000007', 'gwei'),
-};
-
-// Add a simple transaction cache
-const processedTxs = new Set<string>();
-
-// Add cache cleanup (optional, to prevent memory leaks)
-setInterval(() => {
-    processedTxs.clear();
-}, 1000 * 60 * 60); // Clear cache every hour
-
+// Webhook handler
 router.post('/webhook', async (ctx: Koa.Context) => {
     try {
         const webhookData = ctx.request.body as WebhookBody;
@@ -73,7 +196,7 @@ router.post('/webhook', async (ctx: Koa.Context) => {
         });
 
         for (const activity of activities) {
-            // Check if we've already processed this transaction
+            // Skip processed transactions
             if (processedTxs.has(activity.hash)) {
                 console.log(`Skipping already processed transaction: ${activity.hash}`);
                 continue;
@@ -88,114 +211,41 @@ router.post('/webhook', async (ctx: Koa.Context) => {
                 hash: activity.hash
             });
 
-            // Check if the transfer is to our bridge wallet
-            if (activity.toAddress.toLowerCase() !== BRIDGE_WALLET!.toLowerCase()) {
+            // Verify bridge wallet
+            if (activity.toAddress.toLowerCase() !== process.env.BRIDGE_WALLET_ADDRESS!.toLowerCase()) {
                 console.log('Skipping activity: Not matching bridge wallet', {
                     receivedAddress: activity.toAddress,
-                    expectedAddress: BRIDGE_WALLET,
+                    expectedAddress: process.env.BRIDGE_WALLET_ADDRESS,
                     hash: activity.hash
                 });
                 continue;
             }
 
-            if (activity.category === 'token' &&
-                activity.rawContract?.address.toLowerCase() === WBTC_ARBITRUM.toLowerCase()) {
-                // WBTC transfer - send native BTC on BitLayer
-                console.log(`Processing WBTC transfer: ${activity.fromAddress} sent ${activity.value} WBTC`);
-                try {
-                    // Add transaction to processed set before processing
-                    processedTxs.add(activity.hash);
+            // Find matching token configuration
+            const sourceToken = Object.values(TOKENS).find(token =>
+                activity.category === 'token' &&
+                activity.rawContract?.address.toLowerCase() === token.sourceAddress.toLowerCase()
+            );
 
-                    // Convert WBTC amount (8 decimals) to BTC amount (18 decimals)
-                    // First parse as 8 decimals
-                    const wbtcAmount = ethers.utils.parseUnits(activity.value.toString(), 8);
-                    // Convert to normal number
-                    const wbtcNumber = parseFloat(ethers.utils.formatUnits(wbtcAmount, 8));
-                    // Then format as 18 decimals
-                    const btcAmount = ethers.utils.parseEther(wbtcNumber.toString());
-
-                    // Check BTC balance before transfer
-                    const balance = await bitlayerProvider.getBalance(bitlayerWallet.address);
-                    if (balance.lt(btcAmount)) {
-                        console.error('Insufficient BTC balance:', {
-                            required: ethers.utils.formatEther(btcAmount),
-                            available: ethers.utils.formatEther(balance),
-                            walletAddress: bitlayerWallet.address
-                        });
-                        processedTxs.delete(activity.hash);
-                        continue;
-                    }
-
-                    console.log('Amount conversion:', {
-                        originalWBTC: activity.value,
-                        wbtcDecimals: wbtcAmount.toString(),
-                        btcDecimals: btcAmount.toString()
-                    });
-
-                    const tx = await bitlayerWallet.sendTransaction({
-                        to: activity.fromAddress,
-                        value: btcAmount,
-                        ...BITLAYER_GAS_SETTINGS
-                    });
-                    await tx.wait(1);
-                    console.log(`BTC transfer successful on BitLayer: ${tx.hash}`);
-                } catch (error) {
-                    // If processing fails, remove from processed set
-                    processedTxs.delete(activity.hash);
-                    console.error("BTC transfer failed:", error);
-                }
-            } else if (activity.category === 'token' &&
-                activity.rawContract?.address.toLowerCase() === USDT_ARBITRUM.toLowerCase()) {
-                // USDT transfer
-                console.log(`Processing USDT transfer: ${activity.fromAddress} sent ${activity.value} USDT`);
-                try {
-                    // Add transaction to processed set
-                    processedTxs.add(activity.hash);
-
-                    const tokenContract = new ethers.Contract(
-                        USDT_BITLAYER!,
-                        [
-                            'function transfer(address to, uint256 amount)',
-                            'function balanceOf(address account) view returns (uint256)'
-                        ],
-                        bitlayerWallet
-                    );
-
-                    const amount = ethers.utils.parseUnits(activity.value.toString(), 6);
-
-                    // Check USDT balance before transfer
-                    const balance = await tokenContract.balanceOf(bitlayerWallet.address);
-                    if (balance.lt(amount)) {
-                        console.error('Insufficient USDT balance:', {
-                            required: ethers.utils.formatUnits(amount, 6),
-                            available: ethers.utils.formatUnits(balance, 6),
-                            walletAddress: bitlayerWallet.address
-                        });
-                        processedTxs.delete(activity.hash);
-                        continue;
-                    }
-
-                    const tx = await tokenContract.transfer(
-                        activity.fromAddress,
-                        amount,
-                        {
-                            ...BITLAYER_GAS_SETTINGS
-                        }
-                    );
-                    await tx.wait(1);
-                    console.log(`USDT transfer successful on BitLayer: ${tx.hash}`);
-                } catch (error) {
-                    // Remove from processed set if transfer fails
-                    processedTxs.delete(activity.hash);
-                    console.error("USDT transfer failed:", error);
-                }
-            } else {
-                console.log('Skipping activity: Not matching token or category', {
+            if (!sourceToken) {
+                console.log('Skipping activity: No matching token configuration', {
                     category: activity.category,
-                    tokenAddress: activity.rawContract?.address,
-                    expectedWBTC: WBTC_ARBITRUM,
-                    expectedUSDT: USDT_ARBITRUM
+                    tokenAddress: activity.rawContract?.address
                 });
+                continue;
+            }
+
+            // Add to processed set before processing
+            processedTxs.add(activity.hash);
+
+            // Process transfer based on token type
+            const success = sourceToken.isNative
+                ? await handleNativeTransfer(activity, sourceToken, NETWORKS.BITLAYER)
+                : await handleTokenTransfer(activity, sourceToken, NETWORKS.BITLAYER);
+
+            // Remove from processed set if failed
+            if (!success) {
+                processedTxs.delete(activity.hash);
             }
         }
 
@@ -207,10 +257,12 @@ router.post('/webhook', async (ctx: Koa.Context) => {
     }
 });
 
+// Setup middleware
 app.use(bodyParser());
 app.use(router.routes());
 app.use(router.allowedMethods());
 
+// Start server
 const PORT = process.env.PORT || 3301;
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
