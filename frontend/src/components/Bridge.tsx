@@ -94,6 +94,68 @@ const withRetry = async <T,>(fn: () => Promise<T>, retries = 5, delayMs = 1000):
 // Cache for transaction data
 const txCache = new Map<string, any>();
 
+// Token configurations
+interface TokenConfig {
+    symbol: string;
+    name: string;
+    arbitrumAddress: string;
+    bitlayerAddress?: string;
+    decimals: number;
+    isNative?: boolean;
+    abi: string[];
+}
+
+const TOKENS: { [key: string]: TokenConfig } = {
+    WBTC: {
+        symbol: 'WBTC',
+        name: 'Wrapped Bitcoin',
+        arbitrumAddress: "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f",
+        decimals: 8,
+        isNative: true, // Will be received as native BTC on BitLayer
+        abi: wbtcABI
+    },
+    USDT: {
+        symbol: 'USDT',
+        name: 'Tether USD',
+        arbitrumAddress: "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",
+        bitlayerAddress: "0xfe9f969faf8ad72a83b761138bf25de87eff9dd2",
+        decimals: 6,
+        abi: erc20ABI
+    }
+};
+
+// Network configurations
+interface NetworkConfig {
+    name: string;
+    chainId: number;
+    rpc: string;
+    provider: ethers.providers.JsonRpcProvider;
+}
+
+const NETWORKS: { [key: string]: NetworkConfig } = {
+    ARBITRUM: {
+        name: 'Arbitrum One',
+        chainId: 42161,
+        rpc: ARBITRUM_RPC!,
+        provider: provider
+    },
+    BITLAYER: {
+        name: 'BitLayer',
+        chainId: 200901,
+        rpc: BITLAYER_RPC!,
+        provider: bitlayerProvider
+    }
+};
+
+// Transaction monitoring helpers
+interface TransactionMonitorConfig {
+    fromAmount: string;
+    token: TokenConfig;
+    arbitrumTxHash: string;
+    arbitrumTimestamp: number;
+    walletAddress: string;
+}
+
 const Bridge: React.FC = () => {
     const [amount, setAmount] = useState<string>('');
     const [loading, setLoading] = useState<boolean>(false);
@@ -106,6 +168,235 @@ const Bridge: React.FC = () => {
     const [txHash, setTxHash] = useState<string>('');
     const [bitlayerTxHash, setBitlayerTxHash] = useState<string>('');
     const [monitoring, setMonitoring] = useState<boolean>(false);
+
+    // Move helper functions inside component to access state
+    const monitorNativeTransfer = async (
+        config: TransactionMonitorConfig,
+        currentBlock: number,
+        lastCheckedBlock: number,
+        initialBalance: ethers.BigNumber
+    ) => {
+        const { fromAmount, token, arbitrumTimestamp, walletAddress } = config;
+
+        if (!currentBlock || !lastCheckedBlock) return null;
+
+        // Check new blocks in batches
+        for (let blockNum = lastCheckedBlock + 1; blockNum <= currentBlock; blockNum += 5) {
+            const endBlock = Math.min(blockNum + 4, currentBlock);
+            console.log(`Checking blocks ${blockNum} to ${endBlock}...`);
+
+            const blocks = await Promise.all(
+                Array.from({ length: endBlock - blockNum + 1 }, (_, i) =>
+                    withRetry(() => NETWORKS.BITLAYER.provider.getBlock(blockNum + i))
+                )
+            );
+
+            for (const block of blocks) {
+                if (!block || !block.transactions.length) continue;
+
+                // Get transactions in batches
+                const batchSize = 3;
+                for (let i = 0; i < block.transactions.length; i += batchSize) {
+                    const batch = block.transactions.slice(i, i + batchSize);
+                    const txs = await Promise.all(
+                        batch.map(async txHash => {
+                            if (txCache.has(txHash)) {
+                                return txCache.get(txHash);
+                            }
+                            const tx = await withRetry(() => NETWORKS.BITLAYER.provider.getTransaction(txHash));
+                            txCache.set(txHash, tx);
+                            return tx;
+                        })
+                    );
+
+                    const matchingTx = txs.find(tx =>
+                        tx &&
+                        tx.to?.toLowerCase() === walletAddress.toLowerCase() &&
+                        tx.from?.toLowerCase() === BRIDGE_WALLET?.toLowerCase() &&
+                        tx.value.gt(0) &&
+                        block.timestamp > arbitrumTimestamp
+                    );
+
+                    if (matchingTx) {
+                        // Convert amount based on decimals
+                        const sourceAmount = ethers.utils.parseUnits(fromAmount, token.decimals);
+                        const sourceNumber = parseFloat(ethers.utils.formatUnits(sourceAmount, token.decimals));
+                        const expectedAmount = ethers.utils.parseEther(sourceNumber.toString());
+
+                        if (matchingTx.value.eq(expectedAmount)) {
+                            return matchingTx;
+                        }
+                    }
+
+                    await delay(200);
+                }
+            }
+        }
+        return null;
+    };
+
+    const monitorTokenTransfer = async (
+        config: TransactionMonitorConfig,
+        currentBlock: number,
+        lastCheckedBlock: number
+    ) => {
+        const { fromAmount, token, arbitrumTimestamp, walletAddress } = config;
+
+        if (!token.bitlayerAddress) return null;
+
+        const tokenContract = new ethers.Contract(
+            token.bitlayerAddress,
+            [...token.abi, "event Transfer(address indexed from, address indexed to, uint256 value)"],
+            NETWORKS.BITLAYER.provider
+        );
+
+        const CHUNK_SIZE = 1000;
+        const fromBlock = Math.max(lastCheckedBlock + 1, currentBlock - CHUNK_SIZE);
+
+        const filter = tokenContract.filters.Transfer(BRIDGE_WALLET, walletAddress);
+        console.log('Querying token transfers:', {
+            token: token.symbol,
+            fromBlock,
+            toBlock: currentBlock,
+            from: BRIDGE_WALLET,
+            to: walletAddress
+        });
+
+        const events = await withRetry(() =>
+            tokenContract.queryFilter(filter, fromBlock, currentBlock)
+        );
+
+        console.log(`Found ${events.length} ${token.symbol} transfer events`);
+
+        for (const event of events) {
+            const [from, to, value] = event.args!;
+
+            let tx = txCache.get(event.transactionHash);
+            if (!tx) {
+                tx = await withRetry(() => NETWORKS.BITLAYER.provider.getTransaction(event.transactionHash));
+                txCache.set(event.transactionHash, tx);
+            }
+
+            let block = txCache.get(`block_${tx.blockNumber}`);
+            if (!block) {
+                block = await withRetry(() => NETWORKS.BITLAYER.provider.getBlock(tx.blockNumber));
+                txCache.set(`block_${tx.blockNumber}`, block);
+            }
+
+            if (value.toString() === ethers.utils.parseUnits(fromAmount, token.decimals).toString() &&
+                to.toLowerCase() === walletAddress.toLowerCase() &&
+                from.toLowerCase() === BRIDGE_WALLET?.toLowerCase() &&
+                block.timestamp > arbitrumTimestamp) {
+                return tx;
+            }
+        }
+
+        return null;
+    };
+
+    const monitorBitlayerTransaction = async (fromAmount: string) => {
+        try {
+            const selectedToken = TOKENS[isWBTC ? 'WBTC' : 'USDT'];
+            let initialBalance: ethers.BigNumber;
+            let lastCheckedBlock: number;
+
+            if (selectedToken.isNative) {
+                initialBalance = await withRetry(() => NETWORKS.BITLAYER.provider.getBalance(walletAddress));
+                lastCheckedBlock = await withRetry(() => NETWORKS.BITLAYER.provider.getBlockNumber());
+                console.log(`Initial BitLayer ${selectedToken.symbol} balance:`, ethers.utils.formatEther(initialBalance));
+            } else {
+                const tokenContract = new ethers.Contract(
+                    selectedToken.bitlayerAddress!,
+                    selectedToken.abi,
+                    NETWORKS.BITLAYER.provider
+                );
+                initialBalance = await withRetry(() => tokenContract.balanceOf(walletAddress));
+                lastCheckedBlock = await withRetry(() => NETWORKS.BITLAYER.provider.getBlockNumber());
+                console.log(`Initial BitLayer ${selectedToken.symbol} balance:`,
+                    ethers.utils.formatUnits(initialBalance, selectedToken.decimals));
+            }
+
+            console.log('Starting block number:', lastCheckedBlock);
+
+            return async (txHash: string) => {
+                setMonitoring(true);
+                setTxHash(txHash);
+                let attempts = 0;
+                const maxAttempts = 120;
+
+                // Get Arbitrum transaction timestamp
+                const arbitrumTx = await NETWORKS.ARBITRUM.provider.getTransaction(txHash);
+                const arbitrumBlock = await NETWORKS.ARBITRUM.provider.getBlock(arbitrumTx!.blockNumber!);
+                const arbitrumTimestamp = arbitrumBlock.timestamp;
+
+                const monitorConfig: TransactionMonitorConfig = {
+                    fromAmount,
+                    token: selectedToken,
+                    arbitrumTxHash: txHash,
+                    arbitrumTimestamp,
+                    walletAddress
+                };
+
+                const checkInterval = setInterval(async () => {
+                    try {
+                        if (attempts >= maxAttempts) {
+                            clearInterval(checkInterval);
+                            setMonitoring(false);
+                            showInfo('Transaction monitoring timeout. Please check BitLayer explorer manually.');
+                            return;
+                        }
+
+                        attempts++;
+                        console.log(`Checking BitLayer (attempt ${attempts})...`);
+                        await delay(500);
+
+                        const currentBlock = await withRetry(() => NETWORKS.BITLAYER.provider.getBlockNumber());
+                        let matchingTx;
+
+                        if (selectedToken.isNative) {
+                            const currentBalance = await withRetry(() =>
+                                NETWORKS.BITLAYER.provider.getBalance(walletAddress)
+                            );
+
+                            if (currentBalance.gt(initialBalance)) {
+                                matchingTx = await monitorNativeTransfer(
+                                    monitorConfig,
+                                    currentBlock,
+                                    lastCheckedBlock,
+                                    initialBalance
+                                );
+                            }
+                        } else {
+                            matchingTx = await monitorTokenTransfer(
+                                monitorConfig,
+                                currentBlock,
+                                lastCheckedBlock
+                            );
+                        }
+
+                        if (matchingTx) {
+                            clearInterval(checkInterval);
+                            setMonitoring(false);
+                            setBitlayerTxHash(matchingTx.hash);
+                            showSuccess(`${selectedToken.symbol} received on BitLayer!`, true);
+                            await updateBalances();
+                            return;
+                        }
+
+                        lastCheckedBlock = currentBlock;
+                    } catch (error) {
+                        console.error('Error monitoring BitLayer transaction:', error);
+                        await delay(1000);
+                    }
+                }, 1000);
+
+                return () => clearInterval(checkInterval);
+            };
+        } catch (error) {
+            console.error('Error getting initial BitLayer balance:', error);
+            throw error;
+        }
+    };
 
     const updateBalances = async () => {
         if (!window.ethereum) return;
@@ -215,194 +506,6 @@ const Bridge: React.FC = () => {
         await window.ethereum.request({ method: 'eth_requestAccounts' });
         setConnected(true);
         await updateBalances();
-    };
-
-    const monitorBitlayerTransaction = async (fromAmount: string) => {
-        try {
-            let initialBalance: ethers.BigNumber;
-            let lastCheckedBlock: number;
-
-            if (isWBTC) {
-                initialBalance = await withRetry(() => bitlayerProvider.getBalance(walletAddress));
-                lastCheckedBlock = await withRetry(() => bitlayerProvider.getBlockNumber());
-                console.log('Initial BitLayer BTC balance:', ethers.utils.formatEther(initialBalance));
-                console.log('Starting block number:', lastCheckedBlock);
-            } else {
-                const usdtContract = new ethers.Contract(
-                    USDT_BITLAYER,
-                    erc20ABI,
-                    bitlayerProvider
-                );
-                initialBalance = await withRetry(() => usdtContract.balanceOf(walletAddress));
-                console.log('Initial BitLayer USDT balance:', ethers.utils.formatUnits(initialBalance, 6));
-            }
-
-            return async (txHash: string) => {
-                setMonitoring(true);
-                setTxHash(txHash);
-                let attempts = 0;
-                const maxAttempts = 120;
-
-                // Get Arbitrum transaction timestamp
-                const arbitrumTx = await provider.getTransaction(txHash);
-                const arbitrumBlock = await provider.getBlock(arbitrumTx!.blockNumber!);
-                const arbitrumTimestamp = arbitrumBlock.timestamp;
-
-                const checkInterval = setInterval(async () => {
-                    try {
-                        if (attempts >= maxAttempts) {
-                            clearInterval(checkInterval);
-                            setMonitoring(false);
-                            showInfo('Transaction monitoring timeout. Please check BitLayer explorer manually.');
-                            return;
-                        }
-
-                        attempts++;
-                        console.log(`Checking BitLayer (attempt ${attempts})...`);
-
-                        // Add delay between checks
-                        await delay(500);
-
-                        let currentBalance: ethers.BigNumber;
-                        let currentBlock: number;
-
-                        if (isWBTC) {
-                            currentBalance = await withRetry(() => bitlayerProvider.getBalance(walletAddress));
-                            currentBlock = await withRetry(() => bitlayerProvider.getBlockNumber());
-                            console.log('Current BitLayer BTC balance:', ethers.utils.formatEther(currentBalance));
-                            console.log('Current block:', currentBlock);
-
-                            if (currentBalance.gt(initialBalance)) {
-                                // Check new blocks in batches to reduce RPC calls
-                                for (let blockNum = lastCheckedBlock + 1; blockNum <= currentBlock; blockNum += 5) {
-                                    const endBlock = Math.min(blockNum + 4, currentBlock);
-                                    console.log(`Checking blocks ${blockNum} to ${endBlock}...`);
-
-                                    const blocks = await Promise.all(
-                                        Array.from({ length: endBlock - blockNum + 1 }, (_, i) =>
-                                            withRetry(() => bitlayerProvider.getBlock(blockNum + i))
-                                        )
-                                    );
-
-                                    for (const block of blocks) {
-                                        if (!block || !block.transactions.length) continue;
-
-                                        // Get transactions in batches
-                                        const batchSize = 3;
-                                        for (let i = 0; i < block.transactions.length; i += batchSize) {
-                                            const batch = block.transactions.slice(i, i + batchSize);
-                                            const txs = await Promise.all(
-                                                batch.map(async txHash => {
-                                                    if (txCache.has(txHash)) {
-                                                        return txCache.get(txHash);
-                                                    }
-                                                    const tx = await withRetry(() => bitlayerProvider.getTransaction(txHash));
-                                                    txCache.set(txHash, tx);
-                                                    return tx;
-                                                })
-                                            );
-
-                                            // Find matching transaction
-                                            const matchingTx = txs.find(tx =>
-                                                tx &&
-                                                tx.to?.toLowerCase() === walletAddress.toLowerCase() &&
-                                                tx.from?.toLowerCase() === BRIDGE_WALLET?.toLowerCase() &&
-                                                tx.value.gt(0) &&
-                                                block.timestamp > arbitrumTimestamp
-                                            );
-
-                                            if (matchingTx) {
-                                                // Verify the amount matches (convert WBTC 8 decimals to BTC 18 decimals)
-                                                const wbtcAmount = ethers.utils.parseUnits(fromAmount, 8);
-                                                const wbtcNumber = parseFloat(ethers.utils.formatUnits(wbtcAmount, 8));
-                                                const expectedBtcAmount = ethers.utils.parseEther(wbtcNumber.toString());
-
-                                                if (matchingTx.value.eq(expectedBtcAmount)) {
-                                                    clearInterval(checkInterval);
-                                                    setMonitoring(false);
-                                                    setBitlayerTxHash(matchingTx.hash);
-                                                    showSuccess('BTC received on BitLayer!', true);
-                                                    await updateBalances();
-                                                    return;
-                                                }
-                                            }
-
-                                            await delay(200); // Delay between batches
-                                        }
-                                    }
-                                }
-                                lastCheckedBlock = currentBlock;
-                            }
-                        } else {
-                            const usdtContract = new ethers.Contract(
-                                USDT_BITLAYER,
-                                [...erc20ABI, "event Transfer(address indexed from, address indexed to, uint256 value)"],
-                                bitlayerProvider
-                            );
-
-                            // Query events in smaller chunks
-                            const CHUNK_SIZE = 1000;
-                            const latestBlock = await withRetry(() => bitlayerProvider.getBlockNumber());
-                            const fromBlock = Math.max(lastCheckedBlock + 1, latestBlock - CHUNK_SIZE);
-
-                            // Create filter with both from and to addresses
-                            const filter = usdtContract.filters.Transfer(BRIDGE_WALLET, walletAddress);
-                            console.log('Querying USDT transfers with filter:', {
-                                fromBlock,
-                                toBlock: latestBlock,
-                                from: BRIDGE_WALLET,
-                                to: walletAddress
-                            });
-
-                            const events = await withRetry(() =>
-                                usdtContract.queryFilter(filter, fromBlock, latestBlock)
-                            );
-
-                            console.log(`Found ${events.length} USDT transfer events`);
-
-                            for (const event of events) {
-                                const [from, to, value] = event.args!;
-
-                                // Get cached transaction data or fetch new
-                                let bitlayerTx = txCache.get(event.transactionHash);
-                                if (!bitlayerTx) {
-                                    bitlayerTx = await withRetry(() => bitlayerProvider.getTransaction(event.transactionHash));
-                                    txCache.set(event.transactionHash, bitlayerTx);
-                                }
-
-                                let bitlayerBlock = txCache.get(`block_${bitlayerTx.blockNumber}`);
-                                if (!bitlayerBlock) {
-                                    bitlayerBlock = await withRetry(() => bitlayerProvider.getBlock(bitlayerTx.blockNumber));
-                                    txCache.set(`block_${bitlayerTx.blockNumber}`, bitlayerBlock);
-                                }
-
-                                if (value.toString() === ethers.utils.parseUnits(fromAmount, 6).toString() &&
-                                    to.toLowerCase() === walletAddress.toLowerCase() &&
-                                    from.toLowerCase() === BRIDGE_WALLET?.toLowerCase() &&
-                                    bitlayerBlock.timestamp > arbitrumTimestamp) {
-                                    clearInterval(checkInterval);
-                                    setMonitoring(false);
-                                    setBitlayerTxHash(event.transactionHash);
-                                    showSuccess('USDT received on BitLayer!', true);
-                                    await updateBalances();
-                                    return;
-                                }
-                            }
-
-                            lastCheckedBlock = latestBlock;
-                        }
-                    } catch (error) {
-                        console.error('Error monitoring BitLayer transaction:', error);
-                        await delay(1000); // Add delay on error
-                    }
-                }, 1000); // Check every second
-
-                return () => clearInterval(checkInterval);
-            };
-        } catch (error) {
-            console.error('Error getting initial BitLayer balance:', error);
-            throw error;
-        }
     };
 
     const setMaxBalance = () => {
