@@ -80,7 +80,7 @@ const bitlayerProvider = new ethers.providers.JsonRpcProvider(
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 // Add retryable request function with exponential backoff
-const withRetry = async <T,>(fn: () => Promise<T>, retries = 5, delayMs = 2000): Promise<T> => {
+const withRetry = async <T,>(fn: () => Promise<T>, retries = 5, delayMs = 1000): Promise<T> => {
     try {
         return await fn();
     } catch (error: any) {
@@ -261,7 +261,7 @@ const Bridge: React.FC = () => {
                         console.log(`Checking BitLayer (attempt ${attempts})...`);
 
                         // Add delay between checks
-                        await delay(2000);
+                        await delay(500);
 
                         let currentBalance: ethers.BigNumber;
                         let currentBlock: number;
@@ -327,7 +327,7 @@ const Bridge: React.FC = () => {
                                                 }
                                             }
 
-                                            await delay(1000); // Delay between batches
+                                            await delay(200); // Delay between batches
                                         }
                                     }
                                 }
@@ -393,9 +393,9 @@ const Bridge: React.FC = () => {
                         }
                     } catch (error) {
                         console.error('Error monitoring BitLayer transaction:', error);
-                        await delay(2000); // Add delay on error
+                        await delay(1000); // Add delay on error
                     }
-                }, 10000); // Increase interval to 10 seconds
+                }, 1000); // Check every second
 
                 return () => clearInterval(checkInterval);
             };
