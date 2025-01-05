@@ -39,7 +39,7 @@ if (!BRIDGE_WALLET || !ARBITRUM_RPC) {
 const provider = new ethers.providers.JsonRpcProvider(
     {
         url: ARBITRUM_RPC!,
-        timeout: 30000, // 30 seconds
+        timeout: 30000, // 30 seconds timeout
     },
     {
         chainId: 42161,
@@ -55,7 +55,7 @@ const getProviderWithRetry = async () => {
             return provider;
         } catch (error) {
             console.warn(`RPC connection attempt ${i + 1} failed:`, error);
-            if (i === 2) throw error; // Throw on last attempt
+            if (i === 2) throw error; // Throw error on last attempt
             await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1s before retry
         }
     }
@@ -76,19 +76,23 @@ const bitlayerProvider = new ethers.providers.JsonRpcProvider(
     }
 );
 
-// 添加延迟函数
+// Add delay function
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-// 添加带重试的请求函数
-const withRetry = async <T,>(fn: () => Promise<T>, retries = 3, delayMs = 1000): Promise<T> => {
+// Add retryable request function with exponential backoff
+const withRetry = async <T,>(fn: () => Promise<T>, retries = 5, delayMs = 2000): Promise<T> => {
     try {
         return await fn();
     } catch (error: any) {
         if (retries === 0 || error.code !== 429) throw error;
+        console.log(`Rate limited, waiting ${delayMs}ms before retry...`);
         await delay(delayMs);
         return withRetry(fn, retries - 1, delayMs * 2);
     }
 };
+
+// Cache for transaction data
+const txCache = new Map<string, any>();
 
 const Bridge: React.FC = () => {
     const [amount, setAmount] = useState<string>('');
@@ -219,8 +223,8 @@ const Bridge: React.FC = () => {
             let lastCheckedBlock: number;
 
             if (isWBTC) {
-                initialBalance = await bitlayerProvider.getBalance(walletAddress);
-                lastCheckedBlock = await bitlayerProvider.getBlockNumber();
+                initialBalance = await withRetry(() => bitlayerProvider.getBalance(walletAddress));
+                lastCheckedBlock = await withRetry(() => bitlayerProvider.getBlockNumber());
                 console.log('Initial BitLayer BTC balance:', ethers.utils.formatEther(initialBalance));
                 console.log('Starting block number:', lastCheckedBlock);
             } else {
@@ -229,7 +233,7 @@ const Bridge: React.FC = () => {
                     erc20ABI,
                     bitlayerProvider
                 );
-                initialBalance = await usdtContract.balanceOf(walletAddress);
+                initialBalance = await withRetry(() => usdtContract.balanceOf(walletAddress));
                 console.log('Initial BitLayer USDT balance:', ethers.utils.formatUnits(initialBalance, 6));
             }
 
@@ -238,6 +242,11 @@ const Bridge: React.FC = () => {
                 setTxHash(txHash);
                 let attempts = 0;
                 const maxAttempts = 120;
+
+                // Get Arbitrum transaction timestamp
+                const arbitrumTx = await provider.getTransaction(txHash);
+                const arbitrumBlock = await provider.getBlock(arbitrumTx!.blockNumber!);
+                const arbitrumTimestamp = arbitrumBlock.timestamp;
 
                 const checkInterval = setInterval(async () => {
                     try {
@@ -251,55 +260,77 @@ const Bridge: React.FC = () => {
                         attempts++;
                         console.log(`Checking BitLayer (attempt ${attempts})...`);
 
+                        // Add delay between checks
+                        await delay(2000);
+
                         let currentBalance: ethers.BigNumber;
                         let currentBlock: number;
 
                         if (isWBTC) {
-                            currentBalance = await bitlayerProvider.getBalance(walletAddress);
-                            currentBlock = await bitlayerProvider.getBlockNumber();
+                            currentBalance = await withRetry(() => bitlayerProvider.getBalance(walletAddress));
+                            currentBlock = await withRetry(() => bitlayerProvider.getBlockNumber());
                             console.log('Current BitLayer BTC balance:', ethers.utils.formatEther(currentBalance));
                             console.log('Current block:', currentBlock);
 
                             if (currentBalance.gt(initialBalance)) {
-                                // Check all new blocks since last check
-                                for (let blockNum = lastCheckedBlock + 1; blockNum <= currentBlock; blockNum++) {
-                                    console.log(`Checking block ${blockNum}...`);
-                                    const block = await withRetry(() => bitlayerProvider.getBlock(blockNum));
+                                // Check new blocks in batches to reduce RPC calls
+                                for (let blockNum = lastCheckedBlock + 1; blockNum <= currentBlock; blockNum += 5) {
+                                    const endBlock = Math.min(blockNum + 4, currentBlock);
+                                    console.log(`Checking blocks ${blockNum} to ${endBlock}...`);
 
-                                    if (block.transactions.length > 0) {
-                                        // 批量获取交易，每批5个，避免过多并发请求
-                                        const batchSize = 5;
-                                        const txs = [];
+                                    const blocks = await Promise.all(
+                                        Array.from({ length: endBlock - blockNum + 1 }, (_, i) =>
+                                            withRetry(() => bitlayerProvider.getBlock(blockNum + i))
+                                        )
+                                    );
 
+                                    for (const block of blocks) {
+                                        if (!block || !block.transactions.length) continue;
+
+                                        // Get transactions in batches
+                                        const batchSize = 3;
                                         for (let i = 0; i < block.transactions.length; i += batchSize) {
                                             const batch = block.transactions.slice(i, i + batchSize);
-                                            const batchTxs = await Promise.all(
-                                                batch.map(txHash =>
-                                                    withRetry(() => bitlayerProvider.getTransaction(txHash))
-                                                )
+                                            const txs = await Promise.all(
+                                                batch.map(async txHash => {
+                                                    if (txCache.has(txHash)) {
+                                                        return txCache.get(txHash);
+                                                    }
+                                                    const tx = await withRetry(() => bitlayerProvider.getTransaction(txHash));
+                                                    txCache.set(txHash, tx);
+                                                    return tx;
+                                                })
                                             );
-                                            txs.push(...batchTxs);
-                                            await delay(500); // 每批之间添加500ms延迟
-                                        }
 
-                                        // Find matching transaction
-                                        const matchingTx = txs.find(tx =>
-                                            tx &&
-                                            tx.to?.toLowerCase() === walletAddress.toLowerCase() &&
-                                            tx.value.gt(0)
-                                        );
+                                            // Find matching transaction
+                                            const matchingTx = txs.find(tx =>
+                                                tx &&
+                                                tx.to?.toLowerCase() === walletAddress.toLowerCase() &&
+                                                tx.from?.toLowerCase() === BRIDGE_WALLET?.toLowerCase() &&
+                                                tx.value.gt(0) &&
+                                                block.timestamp > arbitrumTimestamp
+                                            );
 
-                                        if (matchingTx) {
-                                            clearInterval(checkInterval);
-                                            setMonitoring(false);
-                                            setBitlayerTxHash(matchingTx.hash);
-                                            showSuccess('BTC received on BitLayer!', true);
-                                            await updateBalances();
-                                            return;
+                                            if (matchingTx) {
+                                                // Verify the amount matches (convert WBTC 8 decimals to BTC 18 decimals)
+                                                const wbtcAmount = ethers.utils.parseUnits(fromAmount, 8);
+                                                const wbtcNumber = parseFloat(ethers.utils.formatUnits(wbtcAmount, 8));
+                                                const expectedBtcAmount = ethers.utils.parseEther(wbtcNumber.toString());
+
+                                                if (matchingTx.value.eq(expectedBtcAmount)) {
+                                                    clearInterval(checkInterval);
+                                                    setMonitoring(false);
+                                                    setBitlayerTxHash(matchingTx.hash);
+                                                    showSuccess('BTC received on BitLayer!', true);
+                                                    await updateBalances();
+                                                    return;
+                                                }
+                                            }
+
+                                            await delay(1000); // Delay between batches
                                         }
                                     }
                                 }
-                                // Update last checked block
                                 lastCheckedBlock = currentBlock;
                             }
                         } else {
@@ -309,12 +340,46 @@ const Bridge: React.FC = () => {
                                 bitlayerProvider
                             );
 
-                            const filter = usdtContract.filters.Transfer(null, walletAddress);
-                            const events = await usdtContract.queryFilter(filter, lastCheckedBlock, 'latest');
+                            // Query events in smaller chunks
+                            const CHUNK_SIZE = 1000;
+                            const latestBlock = await withRetry(() => bitlayerProvider.getBlockNumber());
+                            const fromBlock = Math.max(lastCheckedBlock + 1, latestBlock - CHUNK_SIZE);
+
+                            // Create filter with both from and to addresses
+                            const filter = usdtContract.filters.Transfer(BRIDGE_WALLET, walletAddress);
+                            console.log('Querying USDT transfers with filter:', {
+                                fromBlock,
+                                toBlock: latestBlock,
+                                from: BRIDGE_WALLET,
+                                to: walletAddress
+                            });
+
+                            const events = await withRetry(() =>
+                                usdtContract.queryFilter(filter, fromBlock, latestBlock)
+                            );
+
+                            console.log(`Found ${events.length} USDT transfer events`);
 
                             for (const event of events) {
                                 const [from, to, value] = event.args!;
-                                if (value.toString() === ethers.utils.parseUnits(fromAmount, 6).toString()) {
+
+                                // Get cached transaction data or fetch new
+                                let bitlayerTx = txCache.get(event.transactionHash);
+                                if (!bitlayerTx) {
+                                    bitlayerTx = await withRetry(() => bitlayerProvider.getTransaction(event.transactionHash));
+                                    txCache.set(event.transactionHash, bitlayerTx);
+                                }
+
+                                let bitlayerBlock = txCache.get(`block_${bitlayerTx.blockNumber}`);
+                                if (!bitlayerBlock) {
+                                    bitlayerBlock = await withRetry(() => bitlayerProvider.getBlock(bitlayerTx.blockNumber));
+                                    txCache.set(`block_${bitlayerTx.blockNumber}`, bitlayerBlock);
+                                }
+
+                                if (value.toString() === ethers.utils.parseUnits(fromAmount, 6).toString() &&
+                                    to.toLowerCase() === walletAddress.toLowerCase() &&
+                                    from.toLowerCase() === BRIDGE_WALLET?.toLowerCase() &&
+                                    bitlayerBlock.timestamp > arbitrumTimestamp) {
                                     clearInterval(checkInterval);
                                     setMonitoring(false);
                                     setBitlayerTxHash(event.transactionHash);
@@ -323,11 +388,14 @@ const Bridge: React.FC = () => {
                                     return;
                                 }
                             }
+
+                            lastCheckedBlock = latestBlock;
                         }
                     } catch (error) {
                         console.error('Error monitoring BitLayer transaction:', error);
+                        await delay(2000); // Add delay on error
                     }
-                }, 2000);
+                }, 10000); // Increase interval to 10 seconds
 
                 return () => clearInterval(checkInterval);
             };

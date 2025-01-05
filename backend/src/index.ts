@@ -36,7 +36,12 @@ const BITLAYER_RPC = process.env.BITLAYER_RPC;
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const BRIDGE_WALLET = process.env.BRIDGE_WALLET_ADDRESS;
 const USDT_BITLAYER = process.env.USDT_BITLAYER_ADDRESS;
+const USDT_ARBITRUM = process.env.USDT_ARBITRUM_ADDRESS;
 const WBTC_ARBITRUM = "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f"; // Arbitrum WBTC address
+
+if (!BITLAYER_RPC || !PRIVATE_KEY || !BRIDGE_WALLET || !USDT_BITLAYER || !USDT_ARBITRUM) {
+    throw new Error("Required environment variables are not set");
+}
 
 const bitlayerProvider = new ethers.providers.JsonRpcProvider(BITLAYER_RPC);
 const bitlayerWallet = new ethers.Wallet(PRIVATE_KEY!, bitlayerProvider);
@@ -109,6 +114,18 @@ router.post('/webhook', async (ctx: Koa.Context) => {
                     // Then format as 18 decimals
                     const btcAmount = ethers.utils.parseEther(wbtcNumber.toString());
 
+                    // Check BTC balance before transfer
+                    const balance = await bitlayerProvider.getBalance(bitlayerWallet.address);
+                    if (balance.lt(btcAmount)) {
+                        console.error('Insufficient BTC balance:', {
+                            required: ethers.utils.formatEther(btcAmount),
+                            available: ethers.utils.formatEther(balance),
+                            walletAddress: bitlayerWallet.address
+                        });
+                        processedTxs.delete(activity.hash);
+                        continue;
+                    }
+
                     console.log('Amount conversion:', {
                         originalWBTC: activity.value,
                         wbtcDecimals: wbtcAmount.toString(),
@@ -120,7 +137,7 @@ router.post('/webhook', async (ctx: Koa.Context) => {
                         value: btcAmount,
                         ...BITLAYER_GAS_SETTINGS
                     });
-                    await tx.wait();
+                    await tx.wait(1);
                     console.log(`BTC transfer successful on BitLayer: ${tx.hash}`);
                 } catch (error) {
                     // If processing fails, remove from processed set
@@ -128,26 +145,48 @@ router.post('/webhook', async (ctx: Koa.Context) => {
                     console.error("BTC transfer failed:", error);
                 }
             } else if (activity.category === 'token' &&
-                activity.rawContract?.address.toLowerCase() === WBTC_ARBITRUM.toLowerCase()) {
+                activity.rawContract?.address.toLowerCase() === USDT_ARBITRUM.toLowerCase()) {
                 // USDT transfer
                 console.log(`Processing USDT transfer: ${activity.fromAddress} sent ${activity.value} USDT`);
                 try {
+                    // Add transaction to processed set
+                    processedTxs.add(activity.hash);
+
                     const tokenContract = new ethers.Contract(
                         USDT_BITLAYER!,
-                        ['function transfer(address to, uint256 amount)'],
+                        [
+                            'function transfer(address to, uint256 amount)',
+                            'function balanceOf(address account) view returns (uint256)'
+                        ],
                         bitlayerWallet
                     );
 
+                    const amount = ethers.utils.parseUnits(activity.value.toString(), 6);
+
+                    // Check USDT balance before transfer
+                    const balance = await tokenContract.balanceOf(bitlayerWallet.address);
+                    if (balance.lt(amount)) {
+                        console.error('Insufficient USDT balance:', {
+                            required: ethers.utils.formatUnits(amount, 6),
+                            available: ethers.utils.formatUnits(balance, 6),
+                            walletAddress: bitlayerWallet.address
+                        });
+                        processedTxs.delete(activity.hash);
+                        continue;
+                    }
+
                     const tx = await tokenContract.transfer(
                         activity.fromAddress,
-                        ethers.utils.parseUnits(activity.value.toString(), 6),
+                        amount,
                         {
                             ...BITLAYER_GAS_SETTINGS
                         }
                     );
-                    await tx.wait();
+                    await tx.wait(1);
                     console.log(`USDT transfer successful on BitLayer: ${tx.hash}`);
                 } catch (error) {
+                    // Remove from processed set if transfer fails
+                    processedTxs.delete(activity.hash);
                     console.error("USDT transfer failed:", error);
                 }
             } else {
@@ -155,7 +194,7 @@ router.post('/webhook', async (ctx: Koa.Context) => {
                     category: activity.category,
                     tokenAddress: activity.rawContract?.address,
                     expectedWBTC: WBTC_ARBITRUM,
-                    expectedUSDT: USDT_BITLAYER
+                    expectedUSDT: USDT_ARBITRUM
                 });
             }
         }
